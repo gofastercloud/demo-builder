@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,30 @@ DEFAULT_FONT_SIZE = 16
 DEFAULT_PADDING = 24
 DEFAULT_WINDOW_BAR = "Colorful"
 DEFAULT_TYPING_SPEED = "45ms"
+
+
+@dataclass(frozen=True)
+class CadencePreset:
+    """Configuration for a VHS typing cadence preset."""
+
+    base_ms: int
+    breath_pause_ms: int = 0
+    variable_speeds: bool = False
+
+
+CADENCE_PRESETS: dict[str, CadencePreset] = {
+    "smooth": CadencePreset(base_ms=35, breath_pause_ms=90),
+    "brisk": CadencePreset(base_ms=22),
+    "human": CadencePreset(base_ms=45, variable_speeds=True),
+    "typewriter": CadencePreset(base_ms=55),
+}
+
+# Deterministic multipliers around the 45ms human base speed -> [34, 52, 38, 61, 43, 63, 32, 54]ms (30-65ms).
+_HUMAN_SPEED_MULTIPLIERS: tuple[float, ...] = (0.75, 1.15, 0.85, 1.35, 0.95, 1.40, 0.70, 1.20)
+_HUMAN_OPERATOR_PAUSE_MS = 75
+_HUMAN_PUNCTUATION_PAUSE_MS = 50
+_SMOOTH_OPERATOR_RE = re.compile(r"(&&|\|\||\||;)")
+_HUMAN_TOKEN_RE = re.compile(r"(?:&&|\|\||\||;|[^\s&|;]+|[&|])(?:\s*)|\s+")
 
 _KEY_ALIASES: dict[str, str] = {
     "tab": "Tab",
@@ -102,15 +128,132 @@ def _parse_duration_ms(value: int | float | str) -> float:
     return ms
 
 
-def _estimate_step_duration_ms(step: dict[str, Any], typing_speed_ms: float) -> float:
+def _normalise_cadence(raw_cadence: Any) -> str | None:
+    """Validate and normalise a typing cadence preset name."""
+    if raw_cadence is None:
+        return None
+    if not isinstance(raw_cadence, str):
+        supported = ", ".join(sorted(CADENCE_PRESETS))
+        raise ValueError(f"Unknown typing cadence preset: {raw_cadence!r}. Supported presets: {supported}")
+    name = raw_cadence.strip().lower()
+    if name not in CADENCE_PRESETS:
+        supported = ", ".join(sorted(CADENCE_PRESETS))
+        raise ValueError(f"Unknown typing cadence preset: {raw_cadence!r}. Supported presets: {supported}")
+    return name
+
+
+def _plan_cadence_line(
+    raw_line: str,
+    preset: CadencePreset,
+    base_ms: float,
+    token_offset: int,
+) -> tuple[list[tuple[str, int, int]], int]:
+    """Split a single line into (text_chunk, speed_ms, pause_after_ms) cadence segments."""
+    if preset.variable_speeds:
+        tokens = _HUMAN_TOKEN_RE.findall(raw_line)
+        segments: list[tuple[str, int, int]] = []
+        token_idx = token_offset
+        for idx, token in enumerate(tokens):
+            multiplier = _HUMAN_SPEED_MULTIPLIERS[token_idx % len(_HUMAN_SPEED_MULTIPLIERS)]
+            token_idx += 1
+            speed_ms = max(1, round(base_ms * multiplier)) if base_ms > 0 else 0
+            pause_ms = 0
+            if idx < len(tokens) - 1:
+                stripped = token.rstrip()
+                if stripped.endswith(("&&", "||", "|", ";")):
+                    pause_ms = _HUMAN_OPERATOR_PAUSE_MS
+                elif stripped.endswith((",", ".", ":", "!", "?")):
+                    pause_ms = _HUMAN_PUNCTUATION_PAUSE_MS
+            segments.append((token, speed_ms, pause_ms))
+        return segments, token_idx
+
+    speed_ms = round(base_ms)
+    if preset.breath_pause_ms > 0:
+        parts = _SMOOTH_OPERATOR_RE.split(raw_line)
+        chunks: list[str] = []
+        i = 0
+        while i < len(parts):
+            text_part = parts[i]
+            if i + 1 < len(parts):
+                chunks.append(text_part + parts[i + 1])
+                i += 2
+            else:
+                if text_part:
+                    chunks.append(text_part)
+                i += 1
+        segments = [
+            (chunk, speed_ms, preset.breath_pause_ms if idx < len(chunks) - 1 else 0)
+            for idx, chunk in enumerate(chunks)
+            if chunk
+        ]
+        return segments, token_offset + len(segments)
+
+    return [(raw_line, speed_ms, 0)], token_offset + 1
+
+
+def _compile_type_with_duration(
+    text: str,
+    *,
+    speed: int | float | str | None,
+    cadence: str | None,
+    typing_speed_ms: float,
+) -> tuple[list[str], float]:
+    """Compile a Type step into VHS directives and its exact duration in milliseconds."""
+    if cadence is None:
+        speed_token = _format_duration(speed) if speed is not None else None
+        char_ms = _parse_duration_ms(speed) if speed is not None else typing_speed_ms
+        lines = _compile_type_lines(text, speed_token)
+        raw_lines = text.split("\n")
+        duration_ms = sum(len(seg) * char_ms for seg in raw_lines)
+        duration_ms += max(0, len(raw_lines) - 1) * typing_speed_ms
+        return lines, duration_ms
+
+    preset = CADENCE_PRESETS[cadence]
+    base_ms = _parse_duration_ms(speed) if speed is not None else float(preset.base_ms)
+
+    lines = []
+    duration_ms = 0.0
+    token_offset = 0
+    raw_lines = text.split("\n")
+    for line_idx, raw_line in enumerate(raw_lines):
+        if raw_line:
+            segments, token_offset = _plan_cadence_line(raw_line, preset, base_ms, token_offset)
+            for chunk_text, speed_ms, pause_ms in segments:
+                prefix = f"Type@{speed_ms}ms"
+                for qchunk in _split_quotable_chunks(chunk_text):
+                    lines.append(f"{prefix} {_vhs_quote(qchunk)}")
+                    duration_ms += len(qchunk) * float(speed_ms)
+                if pause_ms > 0:
+                    lines.append(f"Sleep {pause_ms}ms")
+                    duration_ms += float(pause_ms)
+        if line_idx < len(raw_lines) - 1:
+            lines.append("Enter")
+            duration_ms += typing_speed_ms
+
+    return lines, duration_ms
+
+
+def _estimate_step_duration_ms(
+    step: dict[str, Any],
+    typing_speed_ms: float,
+    *,
+    default_cadence: str | None = None,
+) -> float:
     """Estimate the visible duration in milliseconds of a single VHS storyboard step."""
     action = step.get("action")
     step_ms = 0.0
 
     if action == "type":
         text = str(step["text"])
-        char_ms = _parse_duration_ms(step["speed"]) if step.get("speed") is not None else typing_speed_ms
-        step_ms = len(text) * char_ms
+        step_cadence = (
+            _normalise_cadence(step["cadence"]) if step.get("cadence") is not None else default_cadence
+        )
+        _, step_ms = _compile_type_with_duration(
+            text,
+            speed=step.get("speed"),
+            cadence=step_cadence,
+            typing_speed_ms=typing_speed_ms,
+        )
         if step.get("enter"):
             step_ms += typing_speed_ms
     elif action == "enter":
@@ -159,7 +302,13 @@ def _compile_type_lines(text: str, speed: str | None) -> list[str]:
     return lines
 
 
-def _compile_step(idx: int, step: dict[str, Any]) -> list[str]:
+def _compile_step(
+    idx: int,
+    step: dict[str, Any],
+    *,
+    default_cadence: str | None = None,
+    typing_speed_ms: float = 45.0,
+) -> list[str]:
     action = step.get("action")
     lines: list[str] = []
 
@@ -167,8 +316,16 @@ def _compile_step(idx: int, step: dict[str, Any]) -> list[str]:
         if "text" not in step or step["text"] is None:
             raise ValueError(f"Step {idx} ('type') requires a 'text' field")
         text = str(step["text"])
-        speed = _format_duration(step["speed"]) if step.get("speed") is not None else None
-        lines.extend(_compile_type_lines(text, speed))
+        step_cadence = (
+            _normalise_cadence(step["cadence"]) if step.get("cadence") is not None else default_cadence
+        )
+        type_lines, _ = _compile_type_with_duration(
+            text,
+            speed=step.get("speed"),
+            cadence=step_cadence,
+            typing_speed_ms=typing_speed_ms,
+        )
+        lines.extend(type_lines)
         if step.get("enter"):
             lines.append("Enter")
     elif action == "enter":
@@ -249,7 +406,14 @@ def compile_tape_with_timings(
     font_size = int(_get_setting(spec, "font_size", DEFAULT_FONT_SIZE))
     padding = int(_get_setting(spec, "padding", DEFAULT_PADDING))
     window_bar = _get_setting(spec, "window_bar", DEFAULT_WINDOW_BAR)
-    raw_typing_speed = _get_setting(spec, "typing_speed", DEFAULT_TYPING_SPEED)
+    terminal_cadence = _normalise_cadence(_get_setting(spec, "cadence"))
+    raw_typing_speed = _get_setting(spec, "typing_speed")
+    if raw_typing_speed is None:
+        raw_typing_speed = (
+            f"{CADENCE_PRESETS[terminal_cadence].base_ms}ms"
+            if terminal_cadence is not None
+            else DEFAULT_TYPING_SPEED
+        )
     typing_speed = _format_duration(raw_typing_speed)
     typing_speed_ms = _parse_duration_ms(raw_typing_speed)
     shell = _get_setting(spec, "shell")
@@ -319,7 +483,12 @@ def compile_tape_with_timings(
         for step_index, step in enumerate(steps):
             idx = step_index + 1
             step_starts[step_index] = elapsed_ms / 1000.0
-            step_lines = _compile_step(idx, step)
+            step_lines = _compile_step(
+                idx,
+                step,
+                default_cadence=terminal_cadence,
+                typing_speed_ms=typing_speed_ms,
+            )
 
             action = step.get("action")
             if action == "hide":
@@ -327,7 +496,11 @@ def compile_tape_with_timings(
             elif action == "show":
                 hidden = False
             elif not hidden:
-                step_ms = _estimate_step_duration_ms(step, typing_speed_ms)
+                step_ms = _estimate_step_duration_ms(
+                    step,
+                    typing_speed_ms,
+                    default_cadence=terminal_cadence,
+                )
                 if step_durations and step_index in step_durations and resolved_pad_steps:
                     target_ms = float(step_durations[step_index]) * 1000.0 + float(resolved_gap_ms)
                     pad_ms = round(target_ms - step_ms)
