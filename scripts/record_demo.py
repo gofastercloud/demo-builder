@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Record deterministic product demo videos from a JSON storyboard using Playwright + ffmpeg.
+"""Record deterministic product demo videos from a JSON storyboard using Playwright or VHS + ffmpeg.
 
-Run with:
-    uv run --with playwright python3 record_demo.py storyboard.json --out-dir docs/assets/demos
+Run browser demos with:
+    uv run --with playwright python3 scripts/record_demo.py storyboard.json --out-dir docs/assets/demos
+
+Run terminal demos with:
+    python3 scripts/record_demo.py storyboard.json --out-dir docs/assets/demos
 """
 
 from __future__ import annotations
@@ -14,9 +17,15 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from playwright.sync_api import Page, sync_playwright
+if TYPE_CHECKING:
+    from playwright.sync_api import Page
+
+try:
+    from scripts.vhs_compiler import compile_tape
+except ModuleNotFoundError:
+    from vhs_compiler import compile_tape
 
 CURSOR_INIT_JS = r"""
 (() => {
@@ -326,27 +335,112 @@ def _transcode(
     print(msg)
 
 
+def _record_browser(
+    spec: dict[str, Any],
+    raw_dir: Path,
+    *,
+    width: int,
+    height: int,
+    headed: bool,
+) -> Path:
+    from playwright.sync_api import sync_playwright
+
+    show_cursor = bool(spec.get("cursor", True))
+    color_scheme = spec.get("color_scheme", "dark")
+    steps = spec.get("steps") or []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=not headed,
+            args=[
+                "--use-gl=angle",
+                "--use-angle=swiftshader",
+                "--enable-webgl",
+                "--ignore-gpu-blocklist",
+            ],
+        )
+        context = browser.new_context(
+            viewport={"width": width, "height": height},
+            device_scale_factor=1,
+            color_scheme=color_scheme,
+            record_video_dir=str(raw_dir),
+            record_video_size={"width": width, "height": height},
+        )
+        page = context.new_page()
+        errors: list[str] = []
+        page.on("pageerror", lambda exc: errors.append(str(exc)))
+        _run_steps(page, steps, show_cursor)
+        video = page.video
+        context.close()
+        browser.close()
+        if video is None:
+            raise RuntimeError("Playwright produced no video")
+        raw_webm = Path(video.path())
+
+    if errors:
+        print(f"warning: {len(errors)} pageerror(s) during recording: {errors}", file=sys.stderr)
+    return raw_webm
+
+
+def _record_terminal(
+    spec: dict[str, Any],
+    raw_dir: Path,
+    *,
+    name: str,
+    out_dir: Path,
+    width: int | None,
+    height: int | None,
+    fps: int | None,
+    keep_tape: bool,
+) -> Path:
+    if not shutil.which("vhs"):
+        raise RuntimeError("vhs not found on PATH (install Charmbracelet VHS to record terminal demos)")
+
+    raw_video = raw_dir / f"{name}.raw.mp4"
+    tape_content = compile_tape(spec, raw_video, width=width, height=height, fps=fps)
+    tape_path = raw_dir / f"{name}.tape"
+    tape_path.write_text(tape_content, encoding="utf-8")
+
+    if keep_tape:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / f"{name}.tape").write_text(tape_content, encoding="utf-8")
+
+    subprocess.run(["vhs", str(tape_path)], check=True)
+    if not raw_video.is_file():
+        raise RuntimeError("vhs produced no video")
+    return raw_video
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Record a scripted browser product demo video.")
+    parser = argparse.ArgumentParser(description="Record a scripted browser or terminal product demo video.")
     parser.add_argument("storyboard", type=Path, help="Path to storyboard JSON file")
     parser.add_argument("--out-dir", type=Path, required=True, help="Output directory for mp4/webm/png")
     parser.add_argument("--name", default=None, help="Output filename stem (defaults to storyboard name)")
     parser.add_argument("--width", type=int, default=None, help="Viewport width (default 1280)")
     parser.add_argument("--height", type=int, default=None, help="Viewport height (default 720)")
-    parser.add_argument("--fps", type=int, default=30, help="Output video FPS (default 30)")
+    parser.add_argument("--fps", type=int, default=None, help="Output video FPS (default 30)")
     parser.add_argument("--crf", type=int, default=22, help="H.264 CRF quality (default 22)")
     parser.add_argument("--poster-time", type=float, default=None, help="Poster frame timestamp in seconds")
     parser.add_argument("--no-webm", action="store_true", help="Skip WebM transcode")
     parser.add_argument("--headed", action="store_true", help="Show browser window while recording")
+    parser.add_argument(
+        "--keep-tape",
+        action="store_true",
+        help="Save generated VHS .tape file into --out-dir (terminal mode)",
+    )
     args = parser.parse_args(argv)
 
     spec = json.loads(args.storyboard.read_text(encoding="utf-8"))
+    mode = spec.get("mode", "browser")
+    if mode not in ("browser", "terminal"):
+        raise ValueError(f"Unknown storyboard mode: {mode!r}")
+
     name = args.name or spec.get("name") or args.storyboard.stem
-    width = int(args.width or spec.get("width", 1280))
-    height = int(args.height or spec.get("height", 720))
+    term_spec = spec.get("terminal") if isinstance(spec.get("terminal"), dict) else {}
+    width = int(args.width if args.width is not None else term_spec.get("width", spec.get("width", 1280)))
+    height = int(args.height if args.height is not None else term_spec.get("height", spec.get("height", 720)))
+    fps = int(args.fps if args.fps is not None else term_spec.get("fps", spec.get("fps", 30)))
     poster_time = float(args.poster_time if args.poster_time is not None else spec.get("poster_time", 1.5))
-    show_cursor = bool(spec.get("cursor", True))
-    color_scheme = spec.get("color_scheme", "dark")
     steps = spec.get("steps") or []
     if not steps:
         print("error: storyboard has no steps", file=sys.stderr)
@@ -354,42 +448,31 @@ def main(argv: list[str] | None = None) -> int:
 
     with tempfile.TemporaryDirectory(prefix="product-demo-") as tmp:
         raw_dir = Path(tmp)
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=not args.headed,
-                args=[
-                    "--use-gl=angle",
-                    "--use-angle=swiftshader",
-                    "--enable-webgl",
-                    "--ignore-gpu-blocklist",
-                ],
+        if mode == "browser":
+            raw_video = _record_browser(
+                spec,
+                raw_dir,
+                width=width,
+                height=height,
+                headed=args.headed,
             )
-            context = browser.new_context(
-                viewport={"width": width, "height": height},
-                device_scale_factor=1,
-                color_scheme=color_scheme,
-                record_video_dir=str(raw_dir),
-                record_video_size={"width": width, "height": height},
+        else:
+            raw_video = _record_terminal(
+                spec,
+                raw_dir,
+                name=name,
+                out_dir=args.out_dir,
+                width=args.width,
+                height=args.height,
+                fps=args.fps,
+                keep_tape=args.keep_tape,
             )
-            page = context.new_page()
-            errors: list[str] = []
-            page.on("pageerror", lambda exc: errors.append(str(exc)))
-            _run_steps(page, steps, show_cursor)
-            video = page.video
-            context.close()
-            browser.close()
-            if video is None:
-                raise RuntimeError("Playwright produced no video")
-            raw_webm = Path(video.path())
-
-        if errors:
-            print(f"warning: {len(errors)} pageerror(s) during recording: {errors}", file=sys.stderr)
 
         _transcode(
-            raw_webm,
+            raw_video,
             args.out_dir,
             name,
-            args.fps,
+            fps,
             args.crf,
             poster_time,
             not args.no_webm,
