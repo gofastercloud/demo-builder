@@ -542,3 +542,209 @@ def build_highlight_filter(
         return [f"[{in_lbl}]null[{out_lbl}]"]
 
     return [f"[{in_lbl}]{','.join(filters)}[{out_lbl}]"]
+
+
+TRANSITION_TYPES: frozenset[str] = frozenset(
+    {
+        "fade",
+        "wipeleft",
+        "wiperight",
+        "slideleft",
+        "slideright",
+        "smoothleft",
+        "smoothright",
+        "dissolve",
+        "zoomin",
+    }
+)
+
+PIP_CORNERS: frozenset[str] = frozenset(
+    {
+        "bottom-right",
+        "bottom-left",
+        "top-right",
+        "top-left",
+    }
+)
+
+
+@dataclass(frozen=True)
+class TransitionSpec:
+    """Configuration for an ffmpeg ``xfade`` transition between two adjacent scenes."""
+
+    type: str = "fade"
+    duration: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.type not in TRANSITION_TYPES:
+            valid = ", ".join(sorted(TRANSITION_TYPES))
+            raise ValueError(f"Unknown transition type: {self.type!r}. Expected one of: {valid}")
+        _require_finite("TransitionSpec duration", self.duration)
+        if self.duration <= 0.0:
+            raise ValueError(f"TransitionSpec duration must be positive, got {self.duration}")
+
+
+def build_xfade_filter(
+    scene_labels: Sequence[str],
+    durations: Sequence[float],
+    transitions: Sequence[TransitionSpec],
+    output_label: str,
+) -> tuple[list[str], list[float]]:
+    """Chain ``xfade`` transitions across 2+ scenes and compute global scene start times.
+
+    Returns ``(segments, scene_starts)`` where ``scene_starts[i]`` is the exact global
+    timestamp at which scene ``i`` begins on the merged timeline after accounting for
+    all cumulative ``transition.duration`` overlaps.
+    """
+    labels = [_strip_brackets(lbl) for lbl in scene_labels]
+    out_lbl = _strip_brackets(output_label)
+
+    if len(labels) < 2:
+        raise ValueError(f"build_xfade_filter requires at least 2 scenes, got {len(labels)}")
+    if len(durations) != len(labels):
+        raise ValueError(
+            f"Number of durations ({len(durations)}) must match number of scenes ({len(labels)})"
+        )
+    if len(transitions) != len(labels) - 1:
+        raise ValueError(
+            f"Number of transitions ({len(transitions)}) must be one fewer than scenes ({len(labels) - 1})"
+        )
+
+    scene_durations: list[float] = []
+    for idx, dur in enumerate(durations):
+        _require_finite(f"Scene {idx} duration", dur)
+        if dur <= 0.0:
+            raise ValueError(f"Scene {idx} duration must be positive, got {dur}")
+        scene_durations.append(float(dur))
+
+    segments: list[str] = []
+    starts: list[float] = [0.0]
+    cumulative = scene_durations[0]
+    current_label = labels[0]
+
+    for idx, trans in enumerate(transitions):
+        next_label = labels[idx + 1]
+        next_dur = scene_durations[idx + 1]
+        if trans.duration > cumulative:
+            raise ValueError(
+                f"Transition {idx} duration ({trans.duration}s) exceeds "
+                f"accumulated timeline duration ({cumulative}s)"
+            )
+        if trans.duration > next_dur:
+            raise ValueError(
+                f"Transition {idx} duration ({trans.duration}s) exceeds "
+                f"scene {idx + 1} duration ({next_dur}s)"
+            )
+
+        offset = cumulative - trans.duration
+        starts.append(offset)
+        cumulative = offset + next_dur
+
+        step_out = out_lbl if idx == len(transitions) - 1 else f"_xfade_{idx}"
+        segments.append(
+            f"[{current_label}][{next_label}]"
+            f"xfade=transition={trans.type}:duration={_fmt_num(trans.duration)}:offset={_fmt_num(offset)}"
+            f"[{step_out}]"
+        )
+        current_label = step_out
+
+    return segments, starts
+
+
+@dataclass(frozen=True)
+class PipConfig:
+    """Configuration for a Picture-in-Picture (PiP) overlay stream."""
+
+    corner: str = "bottom-right"
+    scale: float = 0.32
+    margin: int = 28
+    start: float = 0.0
+    end: float | None = None
+    radius: int = 12
+    border_color: str = "#cdd6f4"
+    border_width: int = 2
+
+    def __post_init__(self) -> None:
+        if self.corner not in PIP_CORNERS:
+            valid = ", ".join(sorted(PIP_CORNERS))
+            raise ValueError(f"Unknown PiP corner: {self.corner!r}. Expected one of: {valid}")
+        _require_finite("PipConfig scale", self.scale)
+        if not (0.0 < self.scale <= 1.0):
+            raise ValueError(f"PipConfig scale must be in (0.0, 1.0], got {self.scale}")
+        _require_finite("PipConfig margin", self.margin)
+        if self.margin < 0:
+            raise ValueError(f"PipConfig margin must be non-negative, got {self.margin}")
+        _require_finite("PipConfig start", self.start)
+        if self.start < 0.0:
+            raise ValueError(f"PipConfig start must be non-negative, got {self.start}")
+        if self.end is not None:
+            _require_finite("PipConfig end", self.end)
+            if self.end <= self.start:
+                raise ValueError(f"PipConfig end ({self.end}) must be greater than start ({self.start})")
+        _require_finite("PipConfig radius", self.radius)
+        if self.radius < 0:
+            raise ValueError(f"PipConfig radius must be non-negative, got {self.radius}")
+        _require_finite("PipConfig border_width", self.border_width)
+        if self.border_width < 0:
+            raise ValueError(f"PipConfig border_width must be non-negative, got {self.border_width}")
+        if not isinstance(self.border_color, str) or not _SAFE_COLOUR_RE.match(self.border_color):
+            raise ValueError(
+                f"PipConfig border_color must be a valid hex or named colour (with optional @opacity), "
+                f"got {self.border_color!r}"
+            )
+
+
+def build_pip_filter(
+    base_label: str,
+    pip_label: str,
+    output_label: str,
+    base_w: int,
+    base_h: int,
+    config: PipConfig,
+) -> list[str]:
+    """Build deterministic ffmpeg filtergraph segments for a rounded Picture-in-Picture overlay.
+
+    Scales ``pip_label`` to ``base_w * config.scale`` (rounded to an even width, with
+    ``h=-2`` preserving aspect ratio and even height), applies optional border and rounded
+    corners, shifts timestamps by ``config.start``, and overlays onto ``base_label`` at
+    the configured corner gated by ``enable``.
+    """
+    base_lbl = _strip_brackets(base_label)
+    pip_lbl = _strip_brackets(pip_label)
+    out_lbl = _strip_brackets(output_label)
+    if base_w <= 0 or base_h <= 0:
+        raise ValueError(f"Base video dimensions must be positive, got {base_w}x{base_h}")
+
+    pip_w = _even(max(2, round(base_w * config.scale)))
+    radius = min(config.radius, pip_w // 2)
+    start_str = _fmt_num(config.start)
+    prepared_lbl = "_pip_card"
+
+    pip_chain: list[str] = [
+        f"[{pip_lbl}]scale=w={pip_w}:h=-2:flags=lanczos",
+        "format=rgba",
+    ]
+    if config.border_width > 0:
+        pip_chain.append(f"drawbox=x=0:y=0:w=iw:h=ih:color={config.border_color}:t={config.border_width}")
+    if radius > 0:
+        pip_chain.append(_rounded_mask_geq(radius))
+    pip_chain.append(f"setpts=PTS-STARTPTS+{start_str}/TB")
+
+    m = config.margin
+    corner_coords = {
+        "top-left": (f"{m}", f"{m}"),
+        "top-right": (f"W-w-{m}", f"{m}"),
+        "bottom-left": (f"{m}", f"H-h-{m}"),
+        "bottom-right": (f"W-w-{m}", f"H-h-{m}"),
+    }
+    x_expr, y_expr = corner_coords[config.corner]
+
+    if config.end is not None:
+        enable = f"between(t,{start_str},{_fmt_num(config.end)})"
+    else:
+        enable = f"gte(t,{start_str})"
+
+    return [
+        ",".join(pip_chain) + f"[{prepared_lbl}]",
+        f"[{base_lbl}][{prepared_lbl}]overlay=x={x_expr}:y={y_expr}:eof_action=pass:enable='{enable}'[{out_lbl}]",
+    ]
