@@ -1,0 +1,27 @@
+[project]
+name = "demo-builder"
+version = "0.1.0"
+description = "Reusable Agent Skill for recording deterministic browser and terminal product demo videos with optional AI narration"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4.0",
+  "ruff>=0.14.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
