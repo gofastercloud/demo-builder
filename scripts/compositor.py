@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -231,11 +232,24 @@ def build_frame_filter(
 
 HIGHLIGHT_STYLES: frozenset[str] = frozenset({"spotlight", "callout", "both"})
 
+_SAFE_COLOUR_RE = re.compile(
+    r"^(?:#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3}(?:[0-9a-fA-F]{2})?)?"
+    r"|0x[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?"
+    r"|[A-Za-z][A-Za-z0-9]*)"
+    r"(?:@(?:(?:0(?:\.\d+)?|1(?:\.0+)?)|0x[0-9a-fA-F]{2}))?$"
+)
+
 
 def _fmt_num(value: float) -> str:
     """Format a floating-point number concisely for ffmpeg filter expressions."""
     formatted = f"{value:.6f}".rstrip("0").rstrip(".")
     return "0" if formatted in ("", "-0") else formatted
+
+
+def _require_finite(name: str, value: float) -> None:
+    """Reject NaN and infinite numeric values."""
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
 
 
 @dataclass(frozen=True)
@@ -252,6 +266,17 @@ class ZoomEvent:
     ease_ms: int = 350
 
     def __post_init__(self) -> None:
+        for field_name, val in (
+            ("start", self.start),
+            ("end", self.end),
+            ("x", self.x),
+            ("y", self.y),
+            ("w", self.w),
+            ("h", self.h),
+            ("scale", self.scale),
+            ("ease_ms", self.ease_ms),
+        ):
+            _require_finite(f"ZoomEvent {field_name}", val)
         if self.start < 0:
             raise ValueError(f"ZoomEvent start must be non-negative, got {self.start}")
         if self.end <= self.start:
@@ -280,6 +305,17 @@ class HighlightEvent:
     border_width: int = 3
 
     def __post_init__(self) -> None:
+        for field_name, val in (
+            ("start", self.start),
+            ("end", self.end),
+            ("x", self.x),
+            ("y", self.y),
+            ("w", self.w),
+            ("h", self.h),
+            ("dim_opacity", self.dim_opacity),
+            ("border_width", self.border_width),
+        ):
+            _require_finite(f"HighlightEvent {field_name}", val)
         if self.start < 0:
             raise ValueError(f"HighlightEvent start must be non-negative, got {self.start}")
         if self.end <= self.start:
@@ -293,8 +329,11 @@ class HighlightEvent:
             raise ValueError(f"HighlightEvent dim_opacity must be in [0.0, 1.0], got {self.dim_opacity}")
         if self.border_width < 0:
             raise ValueError(f"HighlightEvent border_width must be non-negative, got {self.border_width}")
-        if not self.color or not self.color.strip():
-            raise ValueError("HighlightEvent color must be a non-empty string")
+        if not isinstance(self.color, str) or not _SAFE_COLOUR_RE.match(self.color):
+            raise ValueError(
+                f"HighlightEvent color must be a valid hex or named colour (with optional @opacity), "
+                f"got {self.color!r}"
+            )
 
 
 def _extract_region_coords(region: Any) -> tuple[float, float, float, float]:
@@ -330,6 +369,8 @@ def resolve_region(region: Any, width: int, height: int) -> tuple[int, int, int,
         raise ValueError(f"Video dimensions must be positive, got {width}x{height}")
 
     x, y, w, h = _extract_region_coords(region)
+    for field_name, val in (("x", x), ("y", y), ("w", w), ("h", h)):
+        _require_finite(f"Region {field_name}", val)
     if w <= 0 or h <= 0:
         raise ValueError(f"Region dimensions must be positive, got {w}x{h}")
 
@@ -367,21 +408,20 @@ def ease_zoom_progress(t: float, event: ZoomEvent) -> float:
     return 1.0
 
 
-def _zoom_progress_expr(event: ZoomEvent) -> str:
-    """Build an ffmpeg expression for sine ease-in/out progress in ``[0, 1]``."""
-    s = _fmt_num(event.start)
-    e = _fmt_num(event.end)
+def _zoom_progress_inner_expr(event: ZoomEvent) -> str:
+    """Build an ffmpeg sine ease-in/out expression for ``t`` within ``[start, end]``."""
     ease = min(event.ease_ms / 1000.0, (event.end - event.start) / 2.0)
     if ease <= 0.0:
-        return f"between(t,{s},{e})"
+        return "1"
 
+    s = _fmt_num(event.start)
+    e = _fmt_num(event.end)
     ease_s = _fmt_num(ease)
     t_in_end = _fmt_num(event.start + ease)
     t_out_start = _fmt_num(event.end - ease)
     return (
-        f"(between(t,{s},{e})*"
         f"if(lt(t,{t_in_end}),0.5*(1-cos(PI*(t-{s})/{ease_s})),"
-        f"if(gt(t,{t_out_start}),0.5*(1-cos(PI*({e}-t)/{ease_s})),1)))"
+        f"if(gt(t,{t_out_start}),0.5*(1-cos(PI*({e}-t)/{ease_s})),1))"
     )
 
 
@@ -392,11 +432,17 @@ def build_zoom_filter(
     height: int,
     events: Iterable[ZoomEvent],
 ) -> list[str]:
-    """Build deterministic ffmpeg ``crop`` + ``scale`` expressions for smooth camera zooms.
+    """Build deterministic ffmpeg per-frame ``scale`` + ``crop`` expressions for smooth zooms.
+
+    Per-frame ``scale(..., eval=frame)`` upscales the frame by the eased zoom factor
+    before a fixed-size ``crop=w={width}:h={height}`` centres on the target region and
+    clamps strictly within frame bounds.
 
     Empty event sequences return a lightweight ``null`` passthrough. Overlapping zoom
     events (where a later event starts strictly before the previous event ends) raise
-    ``ValueError``.
+    ``ValueError``. Touching events (``curr.start == prev.end``) are mutually exclusive
+    via nested ``if(between(t, start, end), ...)`` with earlier-event precedence at the
+    shared boundary timestamp.
     """
     in_lbl = _strip_brackets(input_label)
     out_lbl = _strip_brackets(output_label)
@@ -413,32 +459,33 @@ def build_zoom_filter(
                 f"Overlapping zoom events: [{prev.start}, {prev.end}] and [{curr.start}, {curr.end}]"
             )
 
-    zoom_terms: list[str] = []
-    cx_terms: list[str] = []
-    cy_terms: list[str] = []
+    # Build mutually exclusive nested if(between(t, start, end), ...) expressions
+    # so touching events never double-count at shared boundary timestamps.
+    z_expr = "1"
+    cx_expr = "0"
+    cy_expr = "0"
 
-    for ev in ordered:
+    for ev in reversed(ordered):
         rx, ry, rw, rh = resolve_region(ev, width, height)
-        target_cx = rx + rw / 2.0
-        target_cy = ry + rh / 2.0
+        target_cx = _fmt_num(rx + rw / 2.0)
+        target_cy = _fmt_num(ry + rh / 2.0)
         s = _fmt_num(ev.start)
         e = _fmt_num(ev.end)
         delta = _fmt_num(ev.scale - 1.0)
-        zoom_terms.append(f"({delta}*{_zoom_progress_expr(ev)})")
-        cx_terms.append(f"(between(t,{s},{e})*{_fmt_num(target_cx)})")
-        cy_terms.append(f"(between(t,{s},{e})*{_fmt_num(target_cy)})")
+        p_inner = _zoom_progress_inner_expr(ev)
+        ev_zoom = f"1+{delta}*{p_inner}"
+        z_expr = f"if(between(t,{s},{e}),{ev_zoom},{z_expr})"
+        cx_expr = f"if(between(t,{s},{e}),{target_cx},{cx_expr})"
+        cy_expr = f"if(between(t,{s},{e}),{target_cy},{cy_expr})"
 
-    z_expr = "1+" + "+".join(zoom_terms)
-    w_expr = f"{width}/({z_expr})"
-    h_expr = f"{height}/({z_expr})"
-    cx_expr = "+".join(cx_terms)
-    cy_expr = "+".join(cy_terms)
-    x_expr = f"clip(({cx_expr})-ow/2,0,iw-ow)"
-    y_expr = f"clip(({cy_expr})-oh/2,0,ih-oh)"
+    scale_w = f"max({width},trunc({width}*({z_expr})/2)*2)"
+    scale_h = f"max({height},trunc({height}*({z_expr})/2)*2)"
+    crop_x = f"clip(({cx_expr})*({z_expr})-{width}/2,0,iw-{width})"
+    crop_y = f"clip(({cy_expr})*({z_expr})-{height}/2,0,ih-{height})"
 
     return [
-        f"[{in_lbl}]crop=w='{w_expr}':h='{h_expr}':x='{x_expr}':y='{y_expr}',"
-        f"scale={width}:{height}:flags=lanczos[{out_lbl}]"
+        f"[{in_lbl}]scale=w='{scale_w}':h='{scale_h}':eval=frame:flags=lanczos,"
+        f"crop=w={width}:h={height}:x='{crop_x}':y='{crop_y}'[{out_lbl}]"
     ]
 
 
