@@ -27,11 +27,18 @@ if TYPE_CHECKING:
 try:
     from scripts.captions import CaptionCue, write_captions
     from scripts.narration import (
+        DEFAULT_MUSIC_DUCK_DB,
+        DEFAULT_MUSIC_FADE_IN,
+        DEFAULT_MUSIC_FADE_OUT,
+        DEFAULT_MUSIC_VOLUME,
         build_narration_plan,
         extract_cues,
+        extract_music,
         find_missing_clips,
         format_missing_clips_error,
+        format_missing_music_error,
         get_narration_options,
+        resolve_cache_path,
         resolve_narration_clips,
         resolve_timeline,
     )
@@ -39,11 +46,18 @@ try:
 except ModuleNotFoundError:
     from captions import CaptionCue, write_captions
     from narration import (
+        DEFAULT_MUSIC_DUCK_DB,
+        DEFAULT_MUSIC_FADE_IN,
+        DEFAULT_MUSIC_FADE_OUT,
+        DEFAULT_MUSIC_VOLUME,
         build_narration_plan,
         extract_cues,
+        extract_music,
         find_missing_clips,
         format_missing_clips_error,
+        format_missing_music_error,
         get_narration_options,
+        resolve_cache_path,
         resolve_narration_clips,
         resolve_timeline,
     )
@@ -255,6 +269,29 @@ def _escape_ffmpeg_subtitles_path(path: Path) -> str:
     return f"'{raw}'"
 
 
+def _music_filter_chain(
+    input_idx: int,
+    music_track: dict[str, Any],
+    vid_dur: float,
+    out_label: str,
+) -> str:
+    """Build the ffmpeg audio filter chain for a looped, trimmed, faded background music bed."""
+    vol = float(music_track.get("volume", DEFAULT_MUSIC_VOLUME))
+    fade_in = min(max(0.0, float(music_track.get("fade_in", DEFAULT_MUSIC_FADE_IN))), vid_dur)
+    fade_out = min(max(0.0, float(music_track.get("fade_out", DEFAULT_MUSIC_FADE_OUT))), vid_dur)
+    fade_out_start = max(0.0, vid_dur - fade_out)
+
+    chain = (
+        f"[{input_idx}:a]aresample=48000,aformat=channel_layouts=stereo,"
+        f"atrim=0:{vid_dur:.3f},asetpts=PTS-STARTPTS,volume={vol}"
+    )
+    if fade_in > 0:
+        chain += f",afade=t=in:st=0:d={fade_in:.3f}"
+    if fade_out > 0:
+        chain += f",afade=t=out:st={fade_out_start:.3f}:d={fade_out:.3f}"
+    return f"{chain}[{out_label}]"
+
+
 def _transcode(
     raw_webm: Path,
     out_dir: Path,
@@ -265,6 +302,7 @@ def _transcode(
     webm: bool,
     audio_tracks: list[dict[str, Any]] | None = None,
     burn_captions_path: Path | None = None,
+    music_track: dict[str, Any] | None = None,
 ) -> None:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg not found on PATH")
@@ -274,6 +312,7 @@ def _transcode(
     poster_path = out_dir / f"{name}.png"
 
     tracks = audio_tracks or []
+    has_audio = bool(tracks or music_track)
     cmd: list[str] = ["ffmpeg", "-y", "-i", str(raw_webm)]
     subtitles_filter = (
         f"subtitles=filename={_escape_ffmpeg_subtitles_path(burn_captions_path)}"
@@ -281,7 +320,7 @@ def _transcode(
         else None
     )
 
-    if tracks:
+    if has_audio:
         vid_dur = _probe_duration(raw_webm)
         fade_start = max(0.0, vid_dur - 1.2)
         filter_parts: list[str] = []
@@ -304,11 +343,38 @@ def _transcode(
             chain += f"[{lbl}]"
             filter_parts.append(chain)
             mix_labels.append(f"[{lbl}]")
-        joined = "".join(mix_labels)
-        filter_parts.append(
-            f"{joined}amix=inputs={len(tracks)}:duration=longest:normalize=0,"
-            f"atrim=0:{vid_dur:.3f},afade=t=out:st={fade_start:.3f}:d=1.2[aout]"
-        )
+
+        if music_track is not None:
+            music_idx = len(tracks) + 1
+            music_path = Path(music_track["path"]).expanduser().resolve()
+            cmd += ["-stream_loop", "-1", "-i", str(music_path)]
+
+            if tracks:
+                joined = "".join(mix_labels)
+                filter_parts.append(
+                    f"{joined}amix=inputs={len(tracks)}:duration=longest:normalize=0,"
+                    f"apad=whole_dur={vid_dur:.3f},atrim=0:{vid_dur:.3f},asetpts=PTS-STARTPTS,"
+                    "asplit=2[narr_mix][narr_sc]"
+                )
+                filter_parts.append(_music_filter_chain(music_idx, music_track, vid_dur, "music"))
+                duck_db = float(music_track.get("duck_db", DEFAULT_MUSIC_DUCK_DB))
+                ratio = min(20.0, max(1.0, 1.0 + abs(duck_db) / 2.0))
+                filter_parts.append(
+                    "[music][narr_sc]sidechaincompress="
+                    f"threshold=0.02:ratio={ratio:.2f}:attack=20:release=250:makeup=1[music_ducked]"
+                )
+                filter_parts.append(
+                    "[narr_mix][music_ducked]amix=inputs=2:duration=longest:normalize=0,"
+                    f"atrim=0:{vid_dur:.3f}[aout]"
+                )
+            else:
+                filter_parts.append(_music_filter_chain(music_idx, music_track, vid_dur, "aout"))
+        else:
+            joined = "".join(mix_labels)
+            filter_parts.append(
+                f"{joined}amix=inputs={len(tracks)}:duration=longest:normalize=0,"
+                f"atrim=0:{vid_dur:.3f},afade=t=out:st={fade_start:.3f}:d=1.2[aout]"
+            )
         cmd += [
             "-filter_complex",
             ";".join(filter_parts),
@@ -374,7 +440,7 @@ def _transcode(
                 "0",
                 "-r",
                 str(fps),
-                *(["-c:a", "libopus", "-b:a", "96k"] if tracks else ["-an"]),
+                *(["-c:a", "libopus", "-b:a", "96k"] if has_audio else ["-an"]),
                 str(webm_path),
             ],
             check=True,
@@ -529,8 +595,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--plan-narration",
+        "--plan-media",
+        dest="plan_narration",
         action="store_true",
-        help="Print narration synthesis manifest as JSON and exit without recording",
+        help="Print narration and music synthesis manifest as JSON and exit without recording",
     )
     parser.add_argument(
         "--narration-dir",
@@ -570,21 +638,44 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     cues = extract_cues(spec)
+    music = extract_music(spec)
     pad_steps, gap_ms, narration_volume = get_narration_options(spec)
     resolved_cues = []
     step_clip_durations: dict[int, float] = {}
+    missing_cues = find_missing_clips(cues, narration_dir) if cues else []
+    music_path: Path | None = None
+    music_missing = False
+    if music is not None:
+        music_target, music_cached = resolve_cache_path(narration_dir, music.id)
+        if music_cached:
+            music_path = music_target
+        else:
+            music_missing = True
+            music_path = music_target
+
+    if missing_cues:
+        print(
+            format_missing_clips_error(
+                missing_cues,
+                storyboard=args.storyboard,
+                narration_dir=narration_dir,
+            ),
+            file=sys.stderr,
+        )
+    if music is not None and music_missing and music_path is not None:
+        print(
+            format_missing_music_error(
+                music,
+                music_path,
+                storyboard=args.storyboard,
+                narration_dir=narration_dir,
+            ),
+            file=sys.stderr,
+        )
+    if missing_cues or music_missing:
+        return 1
+
     if cues:
-        missing = find_missing_clips(cues, narration_dir)
-        if missing:
-            print(
-                format_missing_clips_error(
-                    missing,
-                    storyboard=args.storyboard,
-                    narration_dir=narration_dir,
-                ),
-                file=sys.stderr,
-            )
-            return 1
         resolved_cues = resolve_narration_clips(cues, narration_dir, probe_duration=_probe_duration)
         for rc in resolved_cues:
             if rc.cue.step_index is not None:
@@ -649,6 +740,16 @@ def main(argv: list[str] | None = None) -> int:
             if burn_captions:
                 burn_captions_path = srt_path
 
+        music_track: dict[str, Any] | None = None
+        if music is not None and music_path is not None:
+            music_track = {
+                "path": str(music_path),
+                "volume": music.volume,
+                "duck_db": music.duck_db,
+                "fade_in": music.fade_in,
+                "fade_out": music.fade_out,
+            }
+
         _transcode(
             raw_video,
             args.out_dir,
@@ -659,6 +760,7 @@ def main(argv: list[str] | None = None) -> int:
             not args.no_webm,
             audio_tracks=combined_audio_tracks or None,
             burn_captions_path=burn_captions_path,
+            music_track=music_track,
         )
     return 0
 

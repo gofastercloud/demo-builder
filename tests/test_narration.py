@@ -214,6 +214,7 @@ class TestCacheKeyAndManifest:
             "total": 0,
             "missing_count": 0,
             "cues": [],
+            "music": None,
         }
 
 
@@ -327,6 +328,7 @@ class TestCliPlanNarration:
             "total": 0,
             "missing_count": 0,
             "cues": [],
+            "music": None,
         }
 
     def test_cli_direct_script_invocation(self, tmp_path: Path) -> None:
