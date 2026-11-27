@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import itertools
+import math
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -225,3 +227,271 @@ def build_frame_filter(
     segments.append(f"[{composite_bg}][{fg_label}]overlay=x={overlay_x}:y={overlay_y}:shortest=1[{out_lbl}]")
 
     return segments
+
+
+HIGHLIGHT_STYLES: frozenset[str] = frozenset({"spotlight", "callout", "both"})
+
+
+def _fmt_num(value: float) -> str:
+    """Format a floating-point number concisely for ffmpeg filter expressions."""
+    formatted = f"{value:.6f}".rstrip("0").rstrip(".")
+    return "0" if formatted in ("", "-0") else formatted
+
+
+@dataclass(frozen=True)
+class ZoomEvent:
+    """Declarative camera zoom onto a target region with smooth ease-in/out."""
+
+    start: float
+    end: float
+    x: float
+    y: float
+    w: float
+    h: float
+    scale: float = 1.6
+    ease_ms: int = 350
+
+    def __post_init__(self) -> None:
+        if self.start < 0:
+            raise ValueError(f"ZoomEvent start must be non-negative, got {self.start}")
+        if self.end <= self.start:
+            raise ValueError(f"ZoomEvent end ({self.end}) must be greater than start ({self.start})")
+        if self.w <= 0 or self.h <= 0:
+            raise ValueError(f"ZoomEvent region dimensions must be positive, got {self.w}x{self.h}")
+        if self.scale < 1.0:
+            raise ValueError(f"ZoomEvent scale must be >= 1.0, got {self.scale}")
+        if self.ease_ms < 0:
+            raise ValueError(f"ZoomEvent ease_ms must be non-negative, got {self.ease_ms}")
+
+
+@dataclass(frozen=True)
+class HighlightEvent:
+    """Declarative spotlight dim-surround and/or callout border highlight."""
+
+    start: float
+    end: float
+    x: float
+    y: float
+    w: float
+    h: float
+    style: str = "spotlight"
+    dim_opacity: float = 0.45
+    color: str = "#38bdf8"
+    border_width: int = 3
+
+    def __post_init__(self) -> None:
+        if self.start < 0:
+            raise ValueError(f"HighlightEvent start must be non-negative, got {self.start}")
+        if self.end <= self.start:
+            raise ValueError(f"HighlightEvent end ({self.end}) must be greater than start ({self.start})")
+        if self.w <= 0 or self.h <= 0:
+            raise ValueError(f"HighlightEvent region dimensions must be positive, got {self.w}x{self.h}")
+        if self.style not in HIGHLIGHT_STYLES:
+            valid = ", ".join(sorted(HIGHLIGHT_STYLES))
+            raise ValueError(f"Unknown highlight style: {self.style!r}. Expected one of: {valid}")
+        if not (0.0 <= self.dim_opacity <= 1.0):
+            raise ValueError(f"HighlightEvent dim_opacity must be in [0.0, 1.0], got {self.dim_opacity}")
+        if self.border_width < 0:
+            raise ValueError(f"HighlightEvent border_width must be non-negative, got {self.border_width}")
+        if not self.color or not self.color.strip():
+            raise ValueError("HighlightEvent color must be a non-empty string")
+
+
+def _extract_region_coords(region: Any) -> tuple[float, float, float, float]:
+    """Extract (x, y, w, h) floats from an event dataclass, mapping, or 4-sequence."""
+    if isinstance(region, (ZoomEvent, HighlightEvent)):
+        return (float(region.x), float(region.y), float(region.w), float(region.h))
+    if isinstance(region, Mapping):
+        try:
+            return (
+                float(region["x"]),
+                float(region["y"]),
+                float(region["w"]),
+                float(region["h"]),
+            )
+        except KeyError as exc:
+            raise ValueError(f"Region mapping missing required key: {exc}") from exc
+    if isinstance(region, Sequence) and not isinstance(region, (str, bytes)) and len(region) == 4:
+        return (float(region[0]), float(region[1]), float(region[2]), float(region[3]))
+    if all(hasattr(region, attr) for attr in ("x", "y", "w", "h")):
+        return (float(region.x), float(region.y), float(region.w), float(region.h))
+    raise ValueError(f"Unsupported region specification: {region!r}")
+
+
+def resolve_region(region: Any, width: int, height: int) -> tuple[int, int, int, int]:
+    """Resolve pixel or normalised ``[0.0, 1.0]`` coordinates and clamp to frame bounds.
+
+    When all four values lie within ``[0.0, 1.0]`` (with positive width/height), the
+    region is interpreted as normalised frame coordinates and scaled to pixels.
+    Resulting coordinates are always clamped strictly inside ``[0, width] x [0, height]``
+    with at least 1px width and height.
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Video dimensions must be positive, got {width}x{height}")
+
+    x, y, w, h = _extract_region_coords(region)
+    if w <= 0 or h <= 0:
+        raise ValueError(f"Region dimensions must be positive, got {w}x{h}")
+
+    if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 and 0.0 < w <= 1.0 and 0.0 < h <= 1.0:
+        px, py, pw, ph = x * width, y * height, w * width, h * height
+    else:
+        px, py, pw, ph = x, y, w, h
+
+    x1 = max(0, min(round(px), width))
+    y1 = max(0, min(round(py), height))
+    x2 = max(0, min(round(px + pw), width))
+    y2 = max(0, min(round(py + ph), height))
+
+    if x2 <= x1:
+        x1 = min(x1, width - 1)
+        x2 = x1 + 1
+    if y2 <= y1:
+        y1 = min(y1, height - 1)
+        y2 = y1 + 1
+
+    return (x1, y1, x2 - x1, y2 - y1)
+
+
+def ease_zoom_progress(t: float, event: ZoomEvent) -> float:
+    """Evaluate sine ease-in/out zoom progress in ``[0.0, 1.0]`` at timestamp ``t``."""
+    if t < event.start or t > event.end:
+        return 0.0
+    ease = min(event.ease_ms / 1000.0, (event.end - event.start) / 2.0)
+    if ease <= 0.0:
+        return 1.0
+    if t < event.start + ease:
+        return 0.5 * (1.0 - math.cos(math.pi * (t - event.start) / ease))
+    if t > event.end - ease:
+        return 0.5 * (1.0 - math.cos(math.pi * (event.end - t) / ease))
+    return 1.0
+
+
+def _zoom_progress_expr(event: ZoomEvent) -> str:
+    """Build an ffmpeg expression for sine ease-in/out progress in ``[0, 1]``."""
+    s = _fmt_num(event.start)
+    e = _fmt_num(event.end)
+    ease = min(event.ease_ms / 1000.0, (event.end - event.start) / 2.0)
+    if ease <= 0.0:
+        return f"between(t,{s},{e})"
+
+    ease_s = _fmt_num(ease)
+    t_in_end = _fmt_num(event.start + ease)
+    t_out_start = _fmt_num(event.end - ease)
+    return (
+        f"(between(t,{s},{e})*"
+        f"if(lt(t,{t_in_end}),0.5*(1-cos(PI*(t-{s})/{ease_s})),"
+        f"if(gt(t,{t_out_start}),0.5*(1-cos(PI*({e}-t)/{ease_s})),1)))"
+    )
+
+
+def build_zoom_filter(
+    input_label: str,
+    output_label: str,
+    width: int,
+    height: int,
+    events: Iterable[ZoomEvent],
+) -> list[str]:
+    """Build deterministic ffmpeg ``crop`` + ``scale`` expressions for smooth camera zooms.
+
+    Empty event sequences return a lightweight ``null`` passthrough. Overlapping zoom
+    events (where a later event starts strictly before the previous event ends) raise
+    ``ValueError``.
+    """
+    in_lbl = _strip_brackets(input_label)
+    out_lbl = _strip_brackets(output_label)
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Video dimensions must be positive, got {width}x{height}")
+
+    ordered = sorted(events, key=lambda ev: (ev.start, ev.end))
+    if not ordered:
+        return [f"[{in_lbl}]null[{out_lbl}]"]
+
+    for prev, curr in itertools.pairwise(ordered):
+        if curr.start < prev.end:
+            raise ValueError(
+                f"Overlapping zoom events: [{prev.start}, {prev.end}] and [{curr.start}, {curr.end}]"
+            )
+
+    zoom_terms: list[str] = []
+    cx_terms: list[str] = []
+    cy_terms: list[str] = []
+
+    for ev in ordered:
+        rx, ry, rw, rh = resolve_region(ev, width, height)
+        target_cx = rx + rw / 2.0
+        target_cy = ry + rh / 2.0
+        s = _fmt_num(ev.start)
+        e = _fmt_num(ev.end)
+        delta = _fmt_num(ev.scale - 1.0)
+        zoom_terms.append(f"({delta}*{_zoom_progress_expr(ev)})")
+        cx_terms.append(f"(between(t,{s},{e})*{_fmt_num(target_cx)})")
+        cy_terms.append(f"(between(t,{s},{e})*{_fmt_num(target_cy)})")
+
+    z_expr = "1+" + "+".join(zoom_terms)
+    w_expr = f"{width}/({z_expr})"
+    h_expr = f"{height}/({z_expr})"
+    cx_expr = "+".join(cx_terms)
+    cy_expr = "+".join(cy_terms)
+    x_expr = f"clip(({cx_expr})-ow/2,0,iw-ow)"
+    y_expr = f"clip(({cy_expr})-oh/2,0,ih-oh)"
+
+    return [
+        f"[{in_lbl}]crop=w='{w_expr}':h='{h_expr}':x='{x_expr}':y='{y_expr}',"
+        f"scale={width}:{height}:flags=lanczos[{out_lbl}]"
+    ]
+
+
+def build_highlight_filter(
+    input_label: str,
+    output_label: str,
+    width: int,
+    height: int,
+    events: Iterable[HighlightEvent],
+) -> list[str]:
+    """Build deterministic ffmpeg ``drawbox`` spotlight and/or callout border overlays.
+
+    Each overlay is strictly gated by ``enable='between(t,start,end)'``. Empty event
+    sequences (or events that produce no visible boxes) return a ``null`` passthrough.
+    """
+    in_lbl = _strip_brackets(input_label)
+    out_lbl = _strip_brackets(output_label)
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Video dimensions must be positive, got {width}x{height}")
+
+    event_list = list(events)
+    if not event_list:
+        return [f"[{in_lbl}]null[{out_lbl}]"]
+
+    filters: list[str] = []
+    for ev in event_list:
+        rx, ry, rw, rh = resolve_region(ev, width, height)
+        enable = f"between(t,{_fmt_num(ev.start)},{_fmt_num(ev.end)})"
+
+        if ev.style in ("spotlight", "both") and ev.dim_opacity > 0.0:
+            dim = f"black@{_fmt_num(ev.dim_opacity)}"
+            # Partition the frame exterior into up to four non-overlapping strips.
+            if ry > 0:
+                filters.append(f"drawbox=x=0:y=0:w={width}:h={ry}:color={dim}:t=fill:enable='{enable}'")
+            if ry + rh < height:
+                filters.append(
+                    f"drawbox=x=0:y={ry + rh}:w={width}:h={height - (ry + rh)}:"
+                    f"color={dim}:t=fill:enable='{enable}'"
+                )
+            if rx > 0:
+                filters.append(f"drawbox=x=0:y={ry}:w={rx}:h={rh}:color={dim}:t=fill:enable='{enable}'")
+            if rx + rw < width:
+                filters.append(
+                    f"drawbox=x={rx + rw}:y={ry}:w={width - (rx + rw)}:h={rh}:"
+                    f"color={dim}:t=fill:enable='{enable}'"
+                )
+
+        if ev.style in ("callout", "both") and ev.border_width > 0:
+            filters.append(
+                f"drawbox=x={rx}:y={ry}:w={rw}:h={rh}:color={ev.color}:t={ev.border_width}:enable='{enable}'"
+            )
+
+    if not filters:
+        return [f"[{in_lbl}]null[{out_lbl}]"]
+
+    return [f"[{in_lbl}]{','.join(filters)}[{out_lbl}]"]
