@@ -23,8 +23,10 @@ if TYPE_CHECKING:
     from playwright.sync_api import Page
 
 try:
+    from scripts.narration import build_narration_plan
     from scripts.vhs_compiler import compile_tape
 except ModuleNotFoundError:
+    from narration import build_narration_plan
     from vhs_compiler import compile_tape
 
 CURSOR_INIT_JS = r"""
@@ -428,9 +430,28 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Save generated VHS .tape file into --out-dir (terminal mode)",
     )
+    parser.add_argument(
+        "--plan-narration",
+        action="store_true",
+        help="Print narration synthesis manifest as JSON and exit without recording",
+    )
+    parser.add_argument(
+        "--narration-dir",
+        type=Path,
+        default=None,
+        help="Directory for cached narration audio clips (default: <out-dir>/.narration-cache)",
+    )
     args = parser.parse_args(argv)
 
     spec = json.loads(args.storyboard.read_text(encoding="utf-8"))
+    if args.plan_narration:
+        narration_dir = (
+            args.narration_dir if args.narration_dir is not None else args.out_dir / ".narration-cache"
+        )
+        plan = build_narration_plan(spec, narration_dir)
+        print(json.dumps(plan, indent=2))
+        return 0
+
     mode = spec.get("mode", "browser")
     if mode not in ("browser", "terminal"):
         raise ValueError(f"Unknown storyboard mode: {mode!r}")
