@@ -15,7 +15,27 @@ DEFAULT_SPEED = 1.0
 DEFAULT_PAD_STEPS = True
 DEFAULT_GAP_MS = 250
 DEFAULT_VOLUME = 1.0
+DEFAULT_MUSIC_MODEL = "fal-ai/cassetteai/music-generator"
+DEFAULT_MUSIC_DURATION_SEC = 30
+DEFAULT_MUSIC_VOLUME = 0.18
+DEFAULT_MUSIC_DUCK_DB = -12.0
+DEFAULT_MUSIC_FADE_IN = 1.0
+DEFAULT_MUSIC_FADE_OUT = 1.5
 AUDIO_EXTENSIONS: tuple[str, ...] = (".wav", ".mp3", ".m4a", ".ogg")
+
+
+@dataclass(frozen=True)
+class MusicSpec:
+    """Optional background music specification extracted from a storyboard."""
+
+    id: str
+    prompt: str
+    model: str
+    duration_sec: float
+    volume: float
+    duck_db: float
+    fade_in: float
+    fade_out: float
 
 
 @dataclass(frozen=True)
@@ -65,6 +85,66 @@ def compute_cache_key(model: str, voice: str, speed: float, text: str) -> str:
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def compute_music_cache_key(model: str, prompt: str, duration_sec: float | int) -> str:
+    """Return the deterministic SHA-256 hex digest for a background music track."""
+    payload = {
+        "duration_sec": float(duration_sec),
+        "model": model,
+        "prompt": prompt,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def extract_music(spec: dict[str, Any]) -> MusicSpec | None:
+    """Extract the optional top-level ``spec['music']`` configuration."""
+    raw = spec.get("music")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("storyboard 'music' field must be an object")
+
+    raw_prompt = raw.get("prompt")
+    if not isinstance(raw_prompt, str) or not raw_prompt.strip():
+        raise ValueError("storyboard 'music' requires a non-empty 'prompt' string")
+    prompt = raw_prompt.strip()
+
+    model = str(raw.get("model") or DEFAULT_MUSIC_MODEL)
+    duration_sec = float(
+        raw["duration_sec"] if raw.get("duration_sec") is not None else DEFAULT_MUSIC_DURATION_SEC
+    )
+    if duration_sec <= 0:
+        raise ValueError(f"music.duration_sec must be positive, got {duration_sec}")
+
+    volume = float(raw["volume"] if raw.get("volume") is not None else DEFAULT_MUSIC_VOLUME)
+    if volume < 0:
+        raise ValueError(f"music.volume must be non-negative, got {volume}")
+
+    duck_db = float(raw["duck_db"] if raw.get("duck_db") is not None else DEFAULT_MUSIC_DUCK_DB)
+    if duck_db > 0:
+        raise ValueError(f"music.duck_db must be <= 0, got {duck_db}")
+
+    fade_in = float(raw["fade_in"] if raw.get("fade_in") is not None else DEFAULT_MUSIC_FADE_IN)
+    if fade_in < 0:
+        raise ValueError(f"music.fade_in must be non-negative, got {fade_in}")
+
+    fade_out = float(raw["fade_out"] if raw.get("fade_out") is not None else DEFAULT_MUSIC_FADE_OUT)
+    if fade_out < 0:
+        raise ValueError(f"music.fade_out must be non-negative, got {fade_out}")
+
+    key = compute_music_cache_key(model=model, prompt=prompt, duration_sec=duration_sec)
+    return MusicSpec(
+        id=key[:16],
+        prompt=prompt,
+        model=model,
+        duration_sec=duration_sec,
+        volume=volume,
+        duck_db=duck_db,
+        fade_in=fade_in,
+        fade_out=fade_out,
+    )
 
 
 def resolve_cache_path(narration_dir: Path | str, cache_id: str) -> tuple[Path, bool]:
@@ -212,11 +292,27 @@ def build_narration_plan(spec: dict[str, Any], narration_dir: Path | str) -> dic
             }
         )
 
+    music = extract_music(spec)
+    music_entry: dict[str, Any] | None = None
+    if music is not None:
+        music_target, music_cached = resolve_cache_path(cache_dir, music.id)
+        if not music_cached:
+            missing_count += 1
+        music_entry = {
+            "id": music.id,
+            "prompt": music.prompt,
+            "model": music.model,
+            "duration_sec": music.duration_sec,
+            "target_path": str(music_target),
+            "cached": music_cached,
+        }
+
     return {
         "narration_dir": str(cache_dir),
         "total": len(manifest_cues),
         "missing_count": missing_count,
         "cues": manifest_cues,
+        "music": music_entry,
     }
 
 
@@ -272,6 +368,30 @@ def format_missing_clips_error(
         f"Run with {cmd_hint} to inspect the synthesis manifest and synthesise the missing "
         "clips via the fal.ai OAuth MCP before recording."
     )
+    return "\n".join(lines)
+
+
+def format_missing_music_error(
+    music: MusicSpec,
+    target_path: Path,
+    *,
+    storyboard: Path | str | None = None,
+    narration_dir: Path | str | None = None,
+) -> str:
+    """Build an actionable error message for a missing cached background music clip."""
+    cmd_hint = "--plan-media"
+    if storyboard is not None:
+        cmd_hint = f"record_demo.py {storyboard} --plan-media"
+        if narration_dir is not None:
+            cmd_hint += f" --narration-dir {narration_dir}"
+    lines = [
+        "error: missing background music audio clip:",
+        f"  - {music.id}: {target_path}",
+        (
+            f"Run with {cmd_hint} to inspect the media synthesis manifest and synthesise "
+            "the missing music track via the fal.ai OAuth MCP before recording."
+        ),
+    ]
     return "\n".join(lines)
 
 
