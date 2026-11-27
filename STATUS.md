@@ -1,25 +1,18 @@
-# Status (in progress — 3/5 tickets shipped)
+# Status (complete — 12/12 tickets shipped across Specs #2 & #12)
 
 ## Goal
-Add `vhs` terminal recording mode (`mode: "terminal"`) and automatic `fal.ai` OAuth MCP narration with synced `.vtt`/`.srt` captions (plus opt-in burn-in) to `demo-builder` — Spec #2.
+- **Spec #2:** COMPLETE (5/5 merged) — `vhs` terminal recording + `fal.ai` OAuth MCP narration & synced `.vtt`/`.srt` captions.
+- **Spec #12:** COMPLETE (7/7 merged) — `ray.so` default framing, synced zooms/highlights, `xfade` transitions, PiP, CLI typing cadence, `fal.ai` sidechain-ducked music, Writer/Editor skill personae.
 
-## Shipped
-- #4 → PR #8 (merged): `scripts/captions.py`, `tests/test_captions.py`
-- #3 → PR #9 (merged): `scripts/vhs_compiler.py`, `scripts/record_demo.py`, `tests/test_vhs.py`
-- #5 → PR #10 (merged): `scripts/narration.py`, `scripts/record_demo.py`, `tests/test_narration.py`
+## Shipped (`main` at `369e1bd`, 186/186 pytest passing)
+- Spec #2: #4 (PR #8), #3 (PR #9), #5 (PR #10), #6 (PR #21), #7 (PR #22).
+- Spec #12: #13 (PR #20), #16 (PR #23), #14 (PR #24), #17 (PR #25), #15 (PR #26), #18 (PR #27), #19 (PR #28).
 
 ## In flight
 - None.
 
 ## Waiting on you
-- Optional note: pre-existing `ruff check .` lint errors (`RUF007`, `B905`) exist in `.claude/hooks/gtq.py:258` on `main` (untouched per agency rules).
-
-## Decisions
-- Unified `scripts/record_demo.py` with `"mode": "browser" | "terminal"` and lazy Playwright import.
-- `fal.ai` OAuth MCP handoff via `--plan-narration` JSON manifest and SHA-256 clip cache (no `FAL_KEY`).
-- Both inline `step.narrate` (auto-timed/padded) and explicit `narration.cues`; `.vtt` + `.srt` default, opt-in `--burn-captions`.
+- Optional: fix pre-existing `ruff check .` errors (`RUF007`, `B905`) in `.claude/hooks/gtq.py:258` on `main`, and close Spec issues #2 and #12 once verified.
 
 ## Next
-- Run `/next` to dispatch `#6` (now unblocked):
-  - #6 (M, unblocked) — Synced narration pacing, audio muxing & captions
-  - #7 (S, blocked by #6) — Update `SKILL.md`, schema reference & `README.md`
+- Backlog drained (0 `ready-for-agent` tickets remaining). Run `/spec <idea>` to plan the next milestone.
