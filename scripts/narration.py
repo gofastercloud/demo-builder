@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,9 @@ from typing import Any
 DEFAULT_MODEL = "fal-ai/kokoro/american-english"
 DEFAULT_VOICE = "af_heart"
 DEFAULT_SPEED = 1.0
+DEFAULT_PAD_STEPS = True
+DEFAULT_GAP_MS = 250
+DEFAULT_VOLUME = 1.0
 AUDIO_EXTENSIONS: tuple[str, ...] = (".wav", ".mp3", ".m4a", ".ogg")
 
 
@@ -25,6 +29,30 @@ class NarrationCue:
     speed: float
     step_index: int | None = None
     at: float | None = None
+
+
+@dataclass(frozen=True)
+class ResolvedNarrationCue:
+    """A narration cue resolved to an existing audio file and its probed duration."""
+
+    cue: NarrationCue
+    path: Path
+    duration: float
+
+
+@dataclass(frozen=True)
+class TimedNarrationCue:
+    """A resolved narration cue placed on the final video timeline."""
+
+    cue: NarrationCue
+    path: Path
+    start: float
+    duration: float
+
+    @property
+    def end(self) -> float:
+        """Return the cue end timestamp in seconds."""
+        return self.start + self.duration
 
 
 def compute_cache_key(model: str, voice: str, speed: float, text: str) -> str:
@@ -190,3 +218,106 @@ def build_narration_plan(spec: dict[str, Any], narration_dir: Path | str) -> dic
         "missing_count": missing_count,
         "cues": manifest_cues,
     }
+
+
+def get_narration_options(spec: dict[str, Any]) -> tuple[bool, int, float]:
+    """Return ``(pad_steps, gap_ms, volume)`` resolved from ``spec['narration']``."""
+    narration_cfg = spec.get("narration")
+    if narration_cfg is not None and not isinstance(narration_cfg, dict):
+        raise ValueError("storyboard 'narration' field must be an object")
+    cfg = narration_cfg or {}
+
+    pad_steps = bool(cfg["pad_steps"]) if cfg.get("pad_steps") is not None else DEFAULT_PAD_STEPS
+    gap_ms = int(cfg["gap_ms"]) if cfg.get("gap_ms") is not None else DEFAULT_GAP_MS
+    if gap_ms < 0:
+        raise ValueError(f"narration.gap_ms must be non-negative, got {gap_ms}")
+    volume = float(cfg["volume"]) if cfg.get("volume") is not None else DEFAULT_VOLUME
+    return pad_steps, gap_ms, volume
+
+
+def find_missing_clips(
+    cues: list[NarrationCue],
+    narration_dir: Path | str,
+) -> list[tuple[NarrationCue, Path]]:
+    """Return ``(cue, target_path)`` pairs for narration clips missing from ``narration_dir``."""
+    missing: list[tuple[NarrationCue, Path]] = []
+    for cue in cues:
+        target_path, cached = resolve_cache_path(narration_dir, cue.id)
+        if not cached:
+            missing.append((cue, target_path))
+    return missing
+
+
+def format_missing_clips_error(
+    missing: list[tuple[NarrationCue, Path]],
+    *,
+    storyboard: Path | str | None = None,
+    narration_dir: Path | str | None = None,
+) -> str:
+    """Build an actionable error message listing missing clips and synthesis instructions."""
+    lines = ["error: missing narration audio clip(s):"]
+    seen: set[str] = set()
+    for cue, target_path in missing:
+        if cue.id in seen:
+            continue
+        seen.add(cue.id)
+        lines.append(f"  - {cue.id}: {target_path}")
+
+    cmd_hint = "--plan-narration"
+    if storyboard is not None:
+        cmd_hint = f"record_demo.py {storyboard} --plan-narration"
+        if narration_dir is not None:
+            cmd_hint += f" --narration-dir {narration_dir}"
+    lines.append(
+        f"Run with {cmd_hint} to inspect the synthesis manifest and synthesise the missing "
+        "clips via the fal.ai OAuth MCP before recording."
+    )
+    return "\n".join(lines)
+
+
+def resolve_narration_clips(
+    cues: list[NarrationCue],
+    narration_dir: Path | str,
+    *,
+    probe_duration: Callable[[Path], float],
+) -> list[ResolvedNarrationCue]:
+    """Resolve existing narration clips and probe each unique clip's duration."""
+    duration_cache: dict[Path, float] = {}
+    resolved: list[ResolvedNarrationCue] = []
+    for cue in cues:
+        clip_path, cached = resolve_cache_path(narration_dir, cue.id)
+        if not cached:
+            raise FileNotFoundError(f"Missing narration clip for cue {cue.id}: {clip_path}")
+        key = clip_path.resolve()
+        if key not in duration_cache:
+            duration_cache[key] = max(0.0, float(probe_duration(clip_path)))
+        resolved.append(ResolvedNarrationCue(cue=cue, path=clip_path, duration=duration_cache[key]))
+    return resolved
+
+
+def resolve_timeline(
+    resolved_cues: list[ResolvedNarrationCue],
+    step_starts: dict[int, float],
+) -> list[TimedNarrationCue]:
+    """Place resolved narration cues onto the recording timeline in chronological order."""
+    indexed: list[tuple[int, TimedNarrationCue]] = []
+    for idx, rc in enumerate(resolved_cues):
+        if rc.cue.at is not None:
+            start = max(0.0, float(rc.cue.at))
+        elif rc.cue.step_index is not None:
+            start = max(0.0, float(step_starts.get(rc.cue.step_index, 0.0)))
+        else:
+            start = 0.0
+        indexed.append(
+            (
+                idx,
+                TimedNarrationCue(
+                    cue=rc.cue,
+                    path=rc.path,
+                    start=start,
+                    duration=rc.duration,
+                ),
+            )
+        )
+    indexed.sort(key=lambda pair: (pair[1].start, pair[0]))
+    return [item for _, item in indexed]

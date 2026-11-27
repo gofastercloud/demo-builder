@@ -79,6 +79,55 @@ def _format_duration(value: int | float | str) -> str:
     return text
 
 
+def _parse_duration_ms(value: int | float | str) -> float:
+    """Parse a numeric or VHS duration token into milliseconds."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        ms = float(value)
+        if ms < 0:
+            raise ValueError(f"Duration must be non-negative, got {value!r}")
+        return ms
+    text = str(value).strip().lower()
+    if not text:
+        raise ValueError("Duration cannot be empty")
+    if text.endswith("ms"):
+        ms = float(text[:-2])
+    elif text.endswith("s"):
+        ms = float(text[:-1]) * 1000.0
+    elif text.endswith("m"):
+        ms = float(text[:-1]) * 60_000.0
+    else:
+        ms = float(text)
+    if ms < 0:
+        raise ValueError(f"Duration must be non-negative, got {value!r}")
+    return ms
+
+
+def _estimate_step_duration_ms(step: dict[str, Any], typing_speed_ms: float) -> float:
+    """Estimate the visible duration in milliseconds of a single VHS storyboard step."""
+    action = step.get("action")
+    step_ms = 0.0
+
+    if action == "type":
+        text = str(step["text"])
+        char_ms = _parse_duration_ms(step["speed"]) if step.get("speed") is not None else typing_speed_ms
+        step_ms = len(text) * char_ms
+        if step.get("enter"):
+            step_ms += typing_speed_ms
+    elif action == "enter":
+        step_ms = int(step.get("count", 1)) * typing_speed_ms
+    elif action in ("pause", "sleep"):
+        step_ms = float(int(step.get("ms", 1000)))
+    elif action == "key":
+        step_ms = int(step.get("count", 1)) * typing_speed_ms
+    elif action == "ctrl":
+        step_ms = typing_speed_ms
+    elif action in ("hide", "show", "wait"):
+        step_ms = 0.0
+
+    after_ms = int(step.get("after_ms", 0))
+    return step_ms + float(after_ms)
+
+
 def _get_setting(spec: dict[str, Any], key: str, default: Any = None) -> Any:
     """Resolve a terminal setting from spec['terminal'] first, falling back to top-level spec."""
     term = spec.get("terminal")
@@ -175,15 +224,23 @@ def _compile_step(idx: int, step: dict[str, Any]) -> list[str]:
     return lines
 
 
-def compile_tape(
+def compile_tape_with_timings(
     spec: dict[str, Any],
     output_path: Path | str,
     *,
     width: int | None = None,
     height: int | None = None,
     fps: int | None = None,
-) -> str:
-    """Compile a terminal storyboard specification dict into a VHS .tape script string."""
+    step_durations: dict[int, float] | None = None,
+    pad_steps: bool | None = None,
+    gap_ms: int | None = None,
+) -> tuple[str, dict[int, float]]:
+    """Compile a terminal storyboard into a VHS .tape script and cumulative step start timestamps.
+
+    When ``step_durations`` (mapping 0-based step index to probed narration clip duration in seconds)
+    is provided and ``pad_steps`` is true, emits ``Sleep`` padding so each narrated step stays on
+    screen for at least ``clip_duration + gap_ms``.
+    """
     resolved_width = int(width if width is not None else _get_setting(spec, "width", DEFAULT_WIDTH))
     resolved_height = int(height if height is not None else _get_setting(spec, "height", DEFAULT_HEIGHT))
     resolved_fps = int(fps if fps is not None else _get_setting(spec, "fps", DEFAULT_FPS))
@@ -192,10 +249,26 @@ def compile_tape(
     font_size = int(_get_setting(spec, "font_size", DEFAULT_FONT_SIZE))
     padding = int(_get_setting(spec, "padding", DEFAULT_PADDING))
     window_bar = _get_setting(spec, "window_bar", DEFAULT_WINDOW_BAR)
-    typing_speed = _format_duration(_get_setting(spec, "typing_speed", DEFAULT_TYPING_SPEED))
+    raw_typing_speed = _get_setting(spec, "typing_speed", DEFAULT_TYPING_SPEED)
+    typing_speed = _format_duration(raw_typing_speed)
+    typing_speed_ms = _parse_duration_ms(raw_typing_speed)
     shell = _get_setting(spec, "shell")
     env = _get_setting(spec, "env")
     cwd = _get_setting(spec, "cwd")
+
+    narration_cfg = spec.get("narration") if isinstance(spec.get("narration"), dict) else {}
+    resolved_pad_steps = (
+        bool(pad_steps)
+        if pad_steps is not None
+        else (bool(narration_cfg["pad_steps"]) if narration_cfg.get("pad_steps") is not None else True)
+    )
+    resolved_gap_ms = (
+        int(gap_ms)
+        if gap_ms is not None
+        else (int(narration_cfg["gap_ms"]) if narration_cfg.get("gap_ms") is not None else 250)
+    )
+    if resolved_gap_ms < 0:
+        raise ValueError(f"gap_ms must be non-negative, got {resolved_gap_ms}")
 
     lines: list[str] = [f"Output {_vhs_quote(str(output_path))}"]
 
@@ -236,10 +309,58 @@ def compile_tape(
         lines.append("Enter")
         lines.append("Show")
 
+    step_starts: dict[int, float] = {}
+    elapsed_ms = 0.0
+    hidden = False
+
     steps = spec.get("steps") or []
     if steps:
         lines.append("")
-        for idx, step in enumerate(steps, 1):
-            lines.extend(_compile_step(idx, step))
+        for step_index, step in enumerate(steps):
+            idx = step_index + 1
+            step_starts[step_index] = elapsed_ms / 1000.0
+            step_lines = _compile_step(idx, step)
 
-    return "\n".join(lines) + "\n"
+            action = step.get("action")
+            if action == "hide":
+                hidden = True
+            elif action == "show":
+                hidden = False
+            elif not hidden:
+                step_ms = _estimate_step_duration_ms(step, typing_speed_ms)
+                if step_durations and step_index in step_durations and resolved_pad_steps:
+                    target_ms = float(step_durations[step_index]) * 1000.0 + float(resolved_gap_ms)
+                    pad_ms = round(target_ms - step_ms)
+                    if pad_ms > 0:
+                        step_lines.append(f"Sleep {pad_ms}ms")
+                        step_ms += float(pad_ms)
+                elapsed_ms += step_ms
+
+            lines.extend(step_lines)
+
+    return "\n".join(lines) + "\n", step_starts
+
+
+def compile_tape(
+    spec: dict[str, Any],
+    output_path: Path | str,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+    fps: int | None = None,
+    step_durations: dict[int, float] | None = None,
+    pad_steps: bool | None = None,
+    gap_ms: int | None = None,
+) -> str:
+    """Compile a terminal storyboard specification dict into a VHS .tape script string."""
+    tape, _ = compile_tape_with_timings(
+        spec,
+        output_path,
+        width=width,
+        height=height,
+        fps=fps,
+        step_durations=step_durations,
+        pad_steps=pad_steps,
+        gap_ms=gap_ms,
+    )
+    return tape

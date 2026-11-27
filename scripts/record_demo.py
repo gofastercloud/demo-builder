@@ -16,6 +16,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -23,11 +25,29 @@ if TYPE_CHECKING:
     from playwright.sync_api import Page
 
 try:
-    from scripts.narration import build_narration_plan
-    from scripts.vhs_compiler import compile_tape
+    from scripts.captions import CaptionCue, write_captions
+    from scripts.narration import (
+        build_narration_plan,
+        extract_cues,
+        find_missing_clips,
+        format_missing_clips_error,
+        get_narration_options,
+        resolve_narration_clips,
+        resolve_timeline,
+    )
+    from scripts.vhs_compiler import compile_tape_with_timings
 except ModuleNotFoundError:
-    from narration import build_narration_plan
-    from vhs_compiler import compile_tape
+    from captions import CaptionCue, write_captions
+    from narration import (
+        build_narration_plan,
+        extract_cues,
+        find_missing_clips,
+        format_missing_clips_error,
+        get_narration_options,
+        resolve_narration_clips,
+        resolve_timeline,
+    )
+    from vhs_compiler import compile_tape_with_timings
 
 CURSOR_INIT_JS = r"""
 (() => {
@@ -108,8 +128,25 @@ def _center_of(page: Page, selector: str, timeout: int = 8000) -> tuple[float, f
     return box["x"] + box["width"] / 2.0, box["y"] + box["height"] / 2.0
 
 
-def _run_steps(page: Page, steps: list[dict[str, Any]], show_cursor: bool) -> None:
-    for idx, step in enumerate(steps, 1):
+def _run_steps(
+    page: Page,
+    steps: list[dict[str, Any]],
+    show_cursor: bool,
+    *,
+    step_clip_durations: dict[int, float] | None = None,
+    pad_steps: bool = True,
+    gap_ms: int = 250,
+    clock: Callable[[], float] = time.monotonic,
+) -> dict[int, float]:
+    step_starts: dict[int, float] = {}
+    recording_start = clock()
+
+    for step_index, step in enumerate(steps):
+        idx = step_index + 1
+        step_start = clock()
+        if step_clip_durations and step_index in step_clip_durations:
+            step_starts[step_index] = max(0.0, step_start - recording_start)
+
         action = step.get("action")
         if action == "goto":
             page.goto(step["url"], wait_until=step.get("wait_until", "networkidle"))
@@ -180,6 +217,15 @@ def _run_steps(page: Page, steps: list[dict[str, Any]], show_cursor: bool) -> No
         if after_ms > 0:
             page.wait_for_timeout(after_ms)
 
+        if step_clip_durations and step_index in step_clip_durations and pad_steps:
+            elapsed = clock() - step_start
+            target = float(step_clip_durations[step_index]) + (gap_ms / 1000.0)
+            remaining_ms = round((target - elapsed) * 1000)
+            if remaining_ms > 0:
+                page.wait_for_timeout(remaining_ms)
+
+    return step_starts
+
 
 def _probe_duration(path: Path) -> float:
     r = subprocess.run(
@@ -200,6 +246,15 @@ def _probe_duration(path: Path) -> float:
     return float(r.stdout.strip())
 
 
+def _escape_ffmpeg_subtitles_path(path: Path) -> str:
+    """Escape and single-quote a filesystem path for ffmpeg's subtitles video filter."""
+    raw = str(path.resolve())
+    raw = raw.replace("\\", "\\\\")
+    raw = raw.replace(":", "\\:")
+    raw = raw.replace("'", "'\\\\\\''")
+    return f"'{raw}'"
+
+
 def _transcode(
     raw_webm: Path,
     out_dir: Path,
@@ -209,6 +264,7 @@ def _transcode(
     poster_time: float,
     webm: bool,
     audio_tracks: list[dict[str, Any]] | None = None,
+    burn_captions_path: Path | None = None,
 ) -> None:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg not found on PATH")
@@ -219,11 +275,20 @@ def _transcode(
 
     tracks = audio_tracks or []
     cmd: list[str] = ["ffmpeg", "-y", "-i", str(raw_webm)]
+    subtitles_filter = (
+        f"subtitles=filename={_escape_ffmpeg_subtitles_path(burn_captions_path)}"
+        if burn_captions_path is not None
+        else None
+    )
 
     if tracks:
         vid_dur = _probe_duration(raw_webm)
         fade_start = max(0.0, vid_dur - 1.2)
         filter_parts: list[str] = []
+        video_map = "0:v:0"
+        if subtitles_filter is not None:
+            filter_parts.append(f"[0:v:0]{subtitles_filter}[vout]")
+            video_map = "[vout]"
         mix_labels: list[str] = []
         for idx, tr in enumerate(tracks, 1):
             t_path = Path(tr["path"]).expanduser().resolve()
@@ -248,7 +313,7 @@ def _transcode(
             "-filter_complex",
             ";".join(filter_parts),
             "-map",
-            "0:v:0",
+            video_map,
             "-map",
             "[aout]",
             "-c:v",
@@ -271,6 +336,8 @@ def _transcode(
             str(mp4_path),
         ]
     else:
+        if subtitles_filter is not None:
+            cmd += ["-vf", subtitles_filter]
         cmd += [
             "-c:v",
             "libx264",
@@ -290,6 +357,8 @@ def _transcode(
 
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
+    # WebM transcodes from mp4_path, so mixed audio and any burned-in captions carry over
+    # to the WebM output without double-rendering subtitles.
     if webm:
         subprocess.run(
             [
@@ -344,6 +413,10 @@ def _record_browser(
     width: int,
     height: int,
     headed: bool,
+    step_clip_durations: dict[int, float] | None = None,
+    pad_steps: bool = True,
+    gap_ms: int = 250,
+    step_starts_out: dict[int, float] | None = None,
 ) -> Path:
     from playwright.sync_api import sync_playwright
 
@@ -371,7 +444,16 @@ def _record_browser(
         page = context.new_page()
         errors: list[str] = []
         page.on("pageerror", lambda exc: errors.append(str(exc)))
-        _run_steps(page, steps, show_cursor)
+        recorded_starts = _run_steps(
+            page,
+            steps,
+            show_cursor,
+            step_clip_durations=step_clip_durations,
+            pad_steps=pad_steps,
+            gap_ms=gap_ms,
+        )
+        if step_starts_out is not None:
+            step_starts_out.update(recorded_starts)
         video = page.video
         context.close()
         browser.close()
@@ -394,12 +476,27 @@ def _record_terminal(
     height: int | None,
     fps: int | None,
     keep_tape: bool,
+    step_clip_durations: dict[int, float] | None = None,
+    pad_steps: bool = True,
+    gap_ms: int = 250,
+    step_starts_out: dict[int, float] | None = None,
 ) -> Path:
     if not shutil.which("vhs"):
         raise RuntimeError("vhs not found on PATH (install Charmbracelet VHS to record terminal demos)")
 
     raw_video = raw_dir / f"{name}.raw.mp4"
-    tape_content = compile_tape(spec, raw_video, width=width, height=height, fps=fps)
+    tape_content, compiled_starts = compile_tape_with_timings(
+        spec,
+        raw_video,
+        width=width,
+        height=height,
+        fps=fps,
+        step_durations=step_clip_durations,
+        pad_steps=pad_steps,
+        gap_ms=gap_ms,
+    )
+    if step_starts_out is not None:
+        step_starts_out.update(compiled_starts)
     tape_path = raw_dir / f"{name}.tape"
     tape_path.write_text(tape_content, encoding="utf-8")
 
@@ -441,13 +538,18 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Directory for cached narration audio clips (default: <out-dir>/.narration-cache)",
     )
+    parser.add_argument(
+        "--burn-captions",
+        action="store_true",
+        help="Burn synced captions into output videos using ffmpeg's subtitles filter",
+    )
     args = parser.parse_args(argv)
 
     spec = json.loads(args.storyboard.read_text(encoding="utf-8"))
+    narration_dir = (
+        args.narration_dir if args.narration_dir is not None else args.out_dir / ".narration-cache"
+    )
     if args.plan_narration:
-        narration_dir = (
-            args.narration_dir if args.narration_dir is not None else args.out_dir / ".narration-cache"
-        )
         plan = build_narration_plan(spec, narration_dir)
         print(json.dumps(plan, indent=2))
         return 0
@@ -467,6 +569,32 @@ def main(argv: list[str] | None = None) -> int:
         print("error: storyboard has no steps", file=sys.stderr)
         return 1
 
+    cues = extract_cues(spec)
+    pad_steps, gap_ms, narration_volume = get_narration_options(spec)
+    resolved_cues = []
+    step_clip_durations: dict[int, float] = {}
+    if cues:
+        missing = find_missing_clips(cues, narration_dir)
+        if missing:
+            print(
+                format_missing_clips_error(
+                    missing,
+                    storyboard=args.storyboard,
+                    narration_dir=narration_dir,
+                ),
+                file=sys.stderr,
+            )
+            return 1
+        resolved_cues = resolve_narration_clips(cues, narration_dir, probe_duration=_probe_duration)
+        for rc in resolved_cues:
+            if rc.cue.step_index is not None:
+                step_clip_durations[rc.cue.step_index] = rc.duration
+
+    captions_cfg = spec.get("captions") if isinstance(spec.get("captions"), dict) else {}
+    burn_captions = bool(args.burn_captions or captions_cfg.get("burn_in", False))
+    caption_max_chars = captions_cfg.get("max_chars", 48)
+
+    step_starts: dict[int, float] = {}
     with tempfile.TemporaryDirectory(prefix="product-demo-") as tmp:
         raw_dir = Path(tmp)
         if mode == "browser":
@@ -476,6 +604,10 @@ def main(argv: list[str] | None = None) -> int:
                 width=width,
                 height=height,
                 headed=args.headed,
+                step_clip_durations=step_clip_durations or None,
+                pad_steps=pad_steps,
+                gap_ms=gap_ms,
+                step_starts_out=step_starts,
             )
         else:
             raw_video = _record_terminal(
@@ -487,7 +619,35 @@ def main(argv: list[str] | None = None) -> int:
                 height=args.height,
                 fps=args.fps,
                 keep_tape=args.keep_tape,
+                step_clip_durations=step_clip_durations or None,
+                pad_steps=pad_steps,
+                gap_ms=gap_ms,
+                step_starts_out=step_starts,
             )
+
+        combined_audio_tracks: list[dict[str, Any]] = list(spec.get("audio_tracks") or [])
+        burn_captions_path: Path | None = None
+        if resolved_cues:
+            timed_cues = resolve_timeline(resolved_cues, step_starts)
+            for timed in timed_cues:
+                combined_audio_tracks.append(
+                    {
+                        "path": str(timed.path),
+                        "start": timed.start,
+                        "volume": narration_volume,
+                    }
+                )
+            caption_cues = [
+                CaptionCue(start=timed.start, end=timed.end, text=timed.cue.text) for timed in timed_cues
+            ]
+            _vtt_path, srt_path = write_captions(
+                caption_cues,
+                args.out_dir,
+                name,
+                max_chars=caption_max_chars,
+            )
+            if burn_captions:
+                burn_captions_path = srt_path
 
         _transcode(
             raw_video,
@@ -497,7 +657,8 @@ def main(argv: list[str] | None = None) -> int:
             args.crf,
             poster_time,
             not args.no_webm,
-            audio_tracks=spec.get("audio_tracks"),
+            audio_tracks=combined_audio_tracks or None,
+            burn_captions_path=burn_captions_path,
         )
     return 0
 
